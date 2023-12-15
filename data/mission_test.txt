@@ -1,0 +1,31 @@
+10 8
+Mission 1 2 0
+1 pick 21 5952 2
+11 drop 142.35 4359 2
+Mission 2 2 1
+2 pick 64 4399 2
+12 drop 249.53 3999 2
+Mission 3 2 2
+3 pick 87 4189 2
+13 drop 213.37 6168 2
+Mission 4 2 2
+10 pick 207 6136 2
+20 drop 391.18 5832 2
+Mission 5 2 3
+4 pick 100 4243 2
+14 drop 277.32 4049 2
+Mission 6 2 4
+5 pick 111 4243 2
+15 drop 232.06 4505 2
+Mission 7 2 5
+7 pick 146 4217 2
+17 drop 269.30 4381 2
+Mission 8 2 6
+8 pick 164 4425 2
+18 drop 347.27 4009 2
+Mission 9 2 7
+9 pick 182 5948 2
+19 drop 302.21 4361 2
+Mission 10 2 0
+6 pick 128 4405 2
+16 drop 305.08 4039 2

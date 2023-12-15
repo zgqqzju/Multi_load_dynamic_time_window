@@ -1,14 +1,9 @@
-"""
-多负载场景下的AGV无冲突路径规划
-Date: 2023-05-28
-要注意一个问题，每个点有固定的访问时间
-如果是pick up类型的访问点，需要判断一下当前的时间是否 >= 要求访问时间，如果不是则需要临时额外增加该边的cost，让车辆在该边等待
-"""
 import copy
-from Astar import PriorityQueue
-from getMap import Map
-import sys
+from getMap import Edge, Map
+import time
 import numpy as np
+from Astar import PriorityQueue
+import sys
 
 sys.setrecursionlimit(30000000)
 INF = 100000000
@@ -41,26 +36,60 @@ total_opp = {7148: 7146, 7147: 7145, 7079: 7078, 6742: 6738, 4071: 4070, 4073: 4
 
 
 class Mission:
-    def __init__(self, idx, loc_list, time_list, loc_type, load, init_map, agv):
+    def __init__(self, idx, arrT, start_1, end_1, start_2, end_2, mission_type, init_map):
         self.map = init_map
+        # idx是GroupTaskId
         self.mission_id = idx
-        self.arr_t = time_list[0]  # 任务最开始的时间
-        self.loc_list = loc_list  # 途经点位置
-        self.loc_type = loc_type  # 途径点类型
-        self.loc_load = load  # 在途径点需要增加还是减少的货物
-        self.time_list = time_list  # 每个途径点要求
-        self.load_set = [1]  # 随时变更的load集合
-        self.path = []  # 路径
-        self.agv = agv
+        # 存储子任务id，默认顺序为先get后put
+        self.arr_t = arrT  # 到达时间点
+        self.init_arrt = arrT
+        self.start_arc = self.map.edge_dic[start_1]  # 起点所在边
+        self.middle_arc_1 = self.map.edge_dic[start_2]  # 途径点1
+        self.middle_arc_2 = self.map.edge_dic[end_1]  # 途径点2
+        self.end_arc = self.map.edge_dic[end_2]  # 终点所在边
+        self.start_node = self.start_arc.start_node  # 起点
+        self.end_node = self.start_arc.end_node  # 终点
+        self.path = []  # 总路径
+        self.agv = None  # AGV
         self.finish_time = -1
         self.arc_win = {}  # 存储path上第几个arc对应的时间窗
         self.arc_win_id = {}  # 存储path上arc时间窗的插入点
-        self.arc_status = []  # 存储path上第几个arc的负载状态，预先计算好
-        # 有三种负载状态：1 空载, 2 小负载, 3 大负载
+        self.arc_status = []  # 存储path上第几个arc的负载状态
+        self.mission_type = mission_type
+        self.cost = 0
 
     @staticmethod
     def distance(start_node, end_node):
         return abs(start_node.x_cor - end_node.x_cor) + abs(start_node.y_cor - end_node.y_cor)
+
+    def getAGV(self, idle_agvs):
+        """
+        为任务寻找最近的空闲车辆
+        :param idle_agvs: 空车集合
+        :return: 返回选择的agv，方便后续移除
+        """
+        min_dis = INF
+        for agv in idle_agvs:
+            # 车辆完成任务后，就长久占据终点的arc，如果出现任务以该arc为子任务节点，则分配该车给任务
+            if agv.cur_loc.id == self.start_arc.id:
+                self.agv = agv
+                break
+            else:
+                if self.distance(self.start_node, agv.cur_loc.start_node) < min_dis:
+                    min_dis = self.distance(self.start_node, agv.cur_loc.start_node)
+                    self.agv = agv
+        # 释放所在arc
+        cur_path = self.agv.cur_loc
+        if len(cur_path.main_out_time) > 0:
+            cur_path.main_out_time[-1] = self.arr_t
+            cur_path.main_time_win[-1] = self.arr_t - cur_path.main_in_time[-1]
+        else:
+            cur_path.main_in_time.append(0)
+            cur_path.main_time_win.append(0)
+            cur_path.main_out_time.append(0)
+            cur_path.main_idx_mission.append(0)
+            cur_path.main_status.append(-1)
+        return self.agv
 
     def aStar_search(self, start, goal, del_set):
         """
@@ -86,7 +115,7 @@ class Mission:
                 new_cost = cost_so_far[current] + self.map.edge_dic[next].cost
                 if (next not in cost_so_far or new_cost < cost_so_far[next]) and next not in del_set:
                     cost_so_far[next] = new_cost
-                    priority = new_cost + self.heuristic(current, next)
+                    priority = new_cost + self.heuristic(next, goal)
                     frontier.put(next, priority)
                     came_from[next] = current
         return came_from, cost_so_far
@@ -122,47 +151,78 @@ class Mission:
         path.reverse()
         return path
 
-    def scheduling_path(self):
+    def scheduling_path(self, idle_location):
         """
-        对多负载任务进行路径规划
-        :return:
+        函数作用: 为任务规划路径，包含两个部分，从AGV所在位置到任务起点、从起点到终点
         """
-        start = self.agv.cur_loc.id
-        for idx, end in enumerate(self.loc_list):
-            came_from, _ = self.aStar_search(start, end, [])
-            path = self.reconstruct_path(came_from, start, end)
-            if not path:
-                return []
-            # 添加路径1
-            path.remove(start)
-            # 计算货物变化
-            if idx > 0:
-                cur_load = self.loc_load[idx - 1]
-                if cur_load < 0:
-                    self.load_set.remove(abs(cur_load))
-                else:
-                    self.load_set.append(cur_load)
-            # 计算负载状态变化
-            max_load = max(self.load_set)
-            self.arc_status += [max_load] * len(path)
-            # 更新path集合
-            self.path += copy.deepcopy(path)
+        del_set = []
+        agv_location = self.agv.cur_loc.id
+        idle_location.append(agv_location)
 
-            # 更新start和end
-            start = end
-        return
+        del_set = []
+        agv_location = self.agv.cur_loc.id
+        came_from1, _ = self.aStar_search(agv_location, self.start_arc.id, del_set)
+        path1 = self.reconstruct_path(came_from1, agv_location, self.start_arc.id)
+        if not path1:
+            return []
+        # 添加路径1
+        path1.remove(agv_location)
+        self.arc_status += [0] * len(path1)
+
+        # 规划从起点到途径点1的路径
+        came_from2, _ = self.aStar_search(self.start_arc.id, self.middle_arc_1.id, del_set)
+        path2 = self.reconstruct_path(came_from2, self.start_arc.id, self.middle_arc_1.id)
+        if not path2:
+            return []
+        # 添加路径2
+        path2.remove(self.start_arc.id)
+        if self.mission_type == 1:
+            self.arc_status += [0] * len(path2)
+        else:
+            self.arc_status += [1] * len(path2)
+
+        # 规划途径点1到途径点2的路径
+        came_from3, _ = self.aStar_search(self.middle_arc_1.id, self.middle_arc_2.id, del_set)
+        path3 = self.reconstruct_path(came_from3, self.middle_arc_1.id, self.middle_arc_2.id)
+        if not path3:
+            return []
+        path3.remove(self.middle_arc_1.id)
+        self.arc_status += [1] * len(path3)
+
+        # 规划途径点2到终点的路径
+        came_from4, _ = self.aStar_search(self.middle_arc_2.id, self.end_arc.id, del_set)
+        path4 = self.reconstruct_path(came_from4, self.middle_arc_2.id, self.end_arc.id)
+        if not path4:
+            return []
+        path4.remove(self.middle_arc_2.id)
+        self.arc_status += [0] * len(path4)
+
+        # 规划从终点返回停车位的任务
+        min_dis = INF
+        for item in idle_location:
+            if self.distance(self.end_node, self.map.edge_dic[item].start_node) < min_dis:
+                agv_back = item
+                min_dis = self.distance(self.end_node, self.map.edge_dic[item].start_node)
+        came_from5, _ = self.aStar_search(self.end_arc.id, agv_back, del_set)
+        path5 = self.reconstruct_path(came_from5, self.end_arc.id, agv_back)
+        if not path5:
+            return []
+        path5.remove(self.end_arc.id)
+        self.arc_status += [0] * len(path5)
+        self.path = path1 + path2 + path3 + path4 + path5
+        idle_location.remove(agv_back)
+        return self.path, idle_location
 
     def __repr__(self):
         return "mission_" + str(self.mission_id)
 
 
 class AGV:
-    def __init__(self, idx, loc, status):
+    def __init__(self, idx, loc):
         self.mission = None
         self.agv_id = idx
         self.cur_loc = loc
         self.back_loc = loc
-        self.cur_status = status
 
     def release_AGV(self):
         self.mission = None
@@ -177,12 +237,42 @@ class MainAlgo:
         self.serve_missions = list()  # 正在插时间窗或者正在下发控制路径的任务
         self.wait_missions = list()
         self.finish_missions = list()  # 已经结束的任务
-        self.agv_set = []
-        self.safe_time = 1
+        self.start_time = 0  # 程序开始的时间作为起始时间
+        self.idle_agvs = list()  # 闲置的agv
+        self.safe_time = 0
+        self.serve_agvs = list()
         self.mission_num = 0
         self.agv_num = 0
         self.back_location = list()
         self.idle_location = list()
+        self.total_time = 0
+        self.wait_time = 0
+        self.total_conflict_time = 0
+
+    def mission_arrive(self):
+        """
+        获取任务
+        :return:
+        """
+        path_file = 'mission_data/speed_30.txt'
+        with open(path_file, encoding='utf-8') as file:
+            content = file.readlines()
+        count = 0
+        for line in content:
+            split_line = line.split()
+            mission_id = int(split_line[0])
+            arr_t = int(split_line[1]) * 100
+            start_1 = int(split_line[2])
+            start_2 = int(split_line[3])
+            end_1 = int(split_line[4])
+            end_2 = int(split_line[5])
+            mission_type = int(split_line[6])
+            self.wait_missions.append(Mission(mission_id, arr_t, start_1, start_2, end_1,
+                                              end_2, mission_type, self.init_map))
+            count += 1
+            if count >= self.mission_num:
+                break
+        return
 
     def init_agv(self):
         """
@@ -199,11 +289,11 @@ class MainAlgo:
             total.append(location)
             total.append(total_opp[location])
 
-        for i in range(5):
+        for i in range(self.agv_num):
             agv_id = i
             location = self.back_location[i]
             loc = self.init_map.edge_dic[location]
-            self.agv_set.append(AGV(agv_id, loc, 0))
+            self.idle_agvs.append(AGV(agv_id, loc))
             loc.main_in_time.append(0)
             loc.main_out_time.append(INF)
             loc.main_time_win.append(INF)
@@ -236,81 +326,58 @@ class MainAlgo:
                 self.init_map.edge_dic[item].load_load_clashed_edge_set = list(set(a).difference(set(b)))
         return
 
-    def mission_arrive(self):
+    def release_AGV(self, cur_mission):
         """
-        获取任务
+        释放在cur_mission前完成任务的AGV
+        :param cur_mission:
         :return:
         """
-        path_file = 'data/mission_split.txt'
-        with open(path_file, encoding='utf-8') as file:
-            content = file.readlines()
-        count = 0
-        while count < len(content) - 1:
-            line = content[count]
-            split_line = line.split()
-            if count == 0:
-                self.mission_num = int(split_line[1])
-                self.agv_num = int(split_line[0])
-                count += 1
-                continue
-            if split_line[0] == 'Mission':
-                agv_id = int(split_line[3])
-                mission_id = int(split_line[1])
-                loc_num = int(split_line[2])
-                count += 1
-                loc_type = []
-                loc_list = []
-                loc_load = []
-                loc_time = []
-                for i in range(loc_num):
-                    line = content[count]
-                    split_line = line.split()
-                    loc_type.append(split_line[1])
-                    loc_time.append(float(split_line[2]) * 100)
-                    loc_list.append(int(split_line[3]))
-                    if split_line[1] == 'pick':
-                        loc_load.append(int(split_line[4]))
-                    else:
-                        load = int(split_line[4])
-                        loc_load.append(-load)
-                    count += 1
-                self.wait_missions.append(Mission(mission_id, loc_list, loc_time, loc_type, loc_load, self.init_map, self.agv_set[agv_id]))
+        for item in self.serve_missions:
+            if item.finish_time < cur_mission.arr_t:
+                self.serve_missions.remove(item)
+                self.finish_missions.append(item)
+                self.serve_agvs.remove(item.agv)
+                self.idle_agvs.append(item.agv)
+                self.cancel_win(item)
         return
 
-    def scheduling_mission(self):
+    def schedule_mission_cycle(self):
         """
-        规划任务主函数
+        考虑任务的延迟情况
         :return:
         """
         # 初始化AGV
-        self.init_agv()
+        # self.init_agv()
         # 任务到达
         self.mission_arrive()
-        # 处理任务
+        # 循环处理任务
         self.wait_missions.sort(key=lambda x: x.arr_t)
-        # 循环处理
+        count = 0
+        max_time = 0
         while self.wait_missions:
-            # 先排序
-            self.wait_missions.sort(key=lambda x: x.arr_t)
-            # 取出一个任务
             cur_mission = self.wait_missions[0]
-            # 释放AGV
             self.release_AGV(cur_mission)
-            if cur_mission.agv.cur_status == 1:
+
+            if len(self.idle_agvs) == 0:
+                """
+                for item in self.wait_missions:
+                    item.arr_t += Interval
+                """
                 cur_mission.arr_t += Interval
-                continue
+                self.wait_missions.sort(key=lambda x: x.arr_t)
             else:
-                cur_mission.agv.mission = cur_mission
-                cur_mission.agv.cur_status = 1
-                cur_mission.scheduling_path()
+                #print(cur_mission.mission_id)
+                cur_agv = cur_mission.getAGV(self.idle_agvs.copy())
+                # 规划路径
+                path, idle_location = cur_mission.scheduling_path(self.idle_location.copy())
+                self.idle_location = idle_location
 
                 # 判断初始能否插入，注意before_id记录的是上一个arc是第几个arc
                 before_id = self.insert_first(cur_mission)
 
                 # 插入不了也需要一直推迟
                 while before_id == -1:
-                    for item in self.wait_missions:
-                        item.arr_t += Interval
+                    cur_mission.arr_t += Interval
                     before_id = self.insert_first(cur_mission)
 
                 # 计算时间窗
@@ -324,23 +391,12 @@ class MainAlgo:
                 # 处理任务和车
                 self.wait_missions.remove(cur_mission)
                 self.serve_missions.append(cur_mission)
-                print(cur_mission.mission_id, cur_mission.arr_t / 100, cur_mission.finish_time / 100)
-        print('所有任务规划完成')
-        return
+                self.idle_agvs.remove(cur_agv)
+                self.serve_agvs.append(cur_agv)
+                count += 1
+                max_time = max(max_time, cur_mission.finish_time / 100)
+                # print(count, max_time)
 
-    def release_AGV(self, cur_mission):
-        """
-        释放在cur_mission前完成任务的AGV
-        :param cur_mission:
-        :return:
-        """
-        for item in self.serve_missions:
-            if item.finish_time < cur_mission.arr_t:
-                self.serve_missions.remove(item)
-                self.finish_missions.append(item)
-                item.agv.cur_status = 0
-                item.mission = None
-                self.cancel_win(item)
         return
 
     def insert_first(self, cur_mission):
@@ -574,6 +630,69 @@ class MainAlgo:
 
         return self.insert_time_part(cur_mission, cur_id)
 
+    def insert_win(self, cur_mission):
+        """
+        将记录好的arc_win插到各个arc的时间向量上去
+        :param cur_mission:
+        :return:
+        """
+        for i in range(0, len(cur_mission.path)):
+            # 获取arc对象
+            cur_path = self.init_map.edge_dic[cur_mission.path[i]]
+            # 获取时间窗
+            cur_win = cur_mission.arc_win[i]
+            # 获取车辆状态
+            cur_status = cur_mission.arc_status[i]
+
+            if i == len(cur_mission.path) - 1:
+                cur_mission.finish_time = cur_win[1]
+                cost = sum([self.init_map.edge_dic[item].cost for item in cur_mission.path])
+                self.wait_time += cur_mission.arr_t / 100 - cur_mission.init_arrt / 100
+                self.total_conflict_time += cur_win[1] / 100 - (cur_mission.init_arrt / 100 + cost / 100)
+                self.total_time += cur_win[1] / 100 - cur_mission.init_arrt / 100
+                print(cur_mission.mission_id, cur_mission.arr_t / 100, cur_win[1] / 100, cur_mission.agv)
+                cur_win[1] = INF
+                cur_mission.agv.cur_loc = cur_path
+
+            # 插主时间窗
+            main_idx = np.searchsorted(cur_path.main_in_time, cur_win[0])
+            cur_path.main_in_time.insert(main_idx, cur_win[0])
+            cur_path.main_out_time.insert(main_idx, cur_win[1])
+            cur_path.main_time_win.insert(main_idx, cur_win[1] - cur_win[0])
+            cur_path.main_idx_mission.insert(main_idx, cur_mission)
+            cur_path.main_status.insert(main_idx, cur_status)
+
+            # 处理冲突边
+            if cur_status == 0:  # 当前车辆状态为空载
+                # 先处理空载-空载的情况
+                for item in cur_path.empty_empty_clashed_edge_set:
+                    if item != cur_path.id:
+                        item_path = self.init_map.edge_dic[item]
+                        item_path.empty_win.append(cur_win.copy())
+                        item_path.empty_mission.append(cur_mission)
+
+                # 处理空载-负载的情况
+                for item in cur_path.empty_load_clashed_edge_set:
+                    if item != cur_path.id:
+                        item_path = self.init_map.edge_dic[item]
+                        item_path.load_win.append(cur_win.copy())
+                        item_path.load_mission.append(cur_mission)
+            else:
+                # 处理负载-空载的情况
+                for item in cur_path.load_empty_clashed_edge_set:
+                    if item != cur_path.id:
+                        item_path = self.init_map.edge_dic[item]
+                        item_path.empty_win.append(cur_win.copy())
+                        item_path.empty_mission.append(cur_mission)
+
+                # 处理负载-负载的情况
+                for item in cur_path.load_load_clashed_edge_set:
+                    if item != cur_path.id:
+                        item_path = self.init_map.edge_dic[item]
+                        item_path.load_win.append(cur_win.copy())
+                        item_path.load_mission.append(cur_mission)
+        return
+
     def time_merge(self, cur_path, agv_status):
         # 用于记录总时间窗
         temp_win = []
@@ -583,12 +702,10 @@ class MainAlgo:
             temp_win.append([cur_path.main_in_time[i], cur_path.main_out_time[i]])
 
         # 根据车辆当前的状态来合并时间窗
-        if agv_status == 1:
+        if agv_status == 0:
             sub_win = copy.deepcopy(cur_path.empty_win)
-        elif agv_status == 2:
-            sub_win = copy.deepcopy(cur_path.load_win)
         else:
-            sub_win = copy.deepcopy(cur_path.multi_load_win)
+            sub_win = copy.deepcopy(cur_path.load_win)
 
         sub_win = sub_win + temp_win
 
@@ -627,102 +744,6 @@ class MainAlgo:
 
         return total_in_time, total_out_time
 
-    def insert_win(self, cur_mission):
-        """
-        将记录好的arc_win插到各个arc的时间向量上去
-        :param cur_mission:
-        :return:
-        """
-        for i in range(0, len(cur_mission.path)):
-            # 获取arc对象
-            cur_path = self.init_map.edge_dic[cur_mission.path[i]]
-            # 获取时间窗
-            cur_win = cur_mission.arc_win[i]
-            # 获取车辆状态
-            cur_status = cur_mission.arc_status[i]
-
-            if i == len(cur_mission.path) - 1:
-                cur_mission.finish_time = cur_win[1]
-                # print(cur_mission.mission_id, cur_mission.arr_t / 100, cur_win[1] / 100, cur_mission.agv)
-                cur_win[1] = INF
-                cur_mission.agv.cur_loc = cur_path
-
-            # 插主时间窗
-            main_idx = np.searchsorted(cur_path.main_in_time, cur_win[0])
-            cur_path.main_in_time.insert(main_idx, cur_win[0])
-            cur_path.main_out_time.insert(main_idx, cur_win[1])
-            cur_path.main_time_win.insert(main_idx, cur_win[1] - cur_win[0])
-            cur_path.main_idx_mission.insert(main_idx, cur_mission)
-            cur_path.main_status.insert(main_idx, cur_status)
-
-            # 处理冲突边
-            if cur_status == 1:  # 当前车辆状态为空载
-                # 先处理空载-空载的情况
-                for item in cur_path.empty_empty_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.empty_win.append(cur_win.copy())
-                        item_path.empty_mission.append(cur_mission)
-
-                # 处理空载-负载的情况
-                for item in cur_path.empty_load_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.load_win.append(cur_win.copy())
-                        item_path.load_mission.append(cur_mission)
-
-                # 处理空载-超载的情况
-                for item in cur_path.empty_multi_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.multi_load_win.append(cur_win.copy())
-                        item_path.multi_load_mission.append(cur_mission)
-
-            elif cur_status == 2:
-                # 处理负载-空载的情况
-                for item in cur_path.load_empty_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.empty_win.append(cur_win.copy())
-                        item_path.empty_mission.append(cur_mission)
-
-                # 处理负载-负载的情况
-                for item in cur_path.load_load_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.load_win.append(cur_win.copy())
-                        item_path.load_mission.append(cur_mission)
-
-                # 处理负载-超载的情况
-                for item in cur_path.load_multi_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.multi_load_win.append(cur_win.copy())
-                        item_path.multi_load_mission.append(cur_mission)
-
-            else:
-                # 处理超载-空载的情况
-                for item in cur_path.multi_empty_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.empty_win.append(cur_win.copy())
-                        item_path.empty_mission.append(cur_mission)
-
-                # 处理超载-负载的情况
-                for item in cur_path.multi_load_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.load_win.append(cur_win.copy())
-                        item_path.load_mission.append(cur_mission)
-
-                # 处理负载-超载的情况
-                for item in cur_path.multi_multi_clashed_edge_set:
-                    if item != cur_path.id:
-                        item_path = self.init_map.edge_dic[item]
-                        item_path.multi_load_win.append(cur_win.copy())
-                        item_path.multi_load_mission.append(cur_mission)
-        return
-
     def cancel_win(self, cur_mission):
         """
         取消对应时间窗
@@ -735,7 +756,7 @@ class MainAlgo:
             item_path = self.init_map.edge_dic[cur_mission.path[i]]
 
             # 删除主时间窗
-            idx_set = [i for i, x in enumerate(item_path.main_idx_mission) if x == cur_mission]
+            idx_set = [k for k, x in enumerate(item_path.main_idx_mission) if x == cur_mission]
             idx_set.reverse()
             for idx in idx_set:
                 del item_path.main_in_time[idx]
@@ -746,7 +767,7 @@ class MainAlgo:
             # 处理相关辅助时间窗
             # 先获取车辆状态
             agv_status = cur_mission.arc_status[i]
-            if agv_status == 1:  # 处理空载范围的时间窗
+            if agv_status == 0:  # 处理空载范围的时间窗
                 # 处理空载-空载的情况
                 for sub in item_path.empty_empty_clashed_edge_set:
                     sub_path = self.init_map.edge_dic[sub]
@@ -765,16 +786,7 @@ class MainAlgo:
                         del sub_path.load_win[idx]
                         del sub_path.load_mission[idx]
 
-                # 处理空载-超载的情况
-                for sub in item_path.empty_multi_clashed_edge_set:
-                    sub_path = self.init_map.edge_dic[sub]
-                    idx_set = [i for i, x in enumerate(sub_path.multi_load_mission) if x == cur_mission]
-                    idx_set.reverse()
-                    for idx in idx_set:
-                        del sub_path.multi_load_win[idx]
-                        del sub_path.multi_load_mission[idx]
-
-            elif agv_status == 2:  # 处理负载范围的时间窗
+            else:  # 处理负载范围的时间窗
                 # 处理负载-空载的情况
                 for sub in item_path.load_empty_clashed_edge_set:
                     sub_path = self.init_map.edge_dic[sub]
@@ -791,52 +803,147 @@ class MainAlgo:
                     for idx in idx_set:
                         del sub_path.load_win[idx]
                         del sub_path.load_mission[idx]
+        return
 
-                # 处理空载-超载的情况
-                for sub in item_path.load_multi_clashed_edge_set:
-                    sub_path = self.init_map.edge_dic[sub]
-                    idx_set = [i for i, x in enumerate(sub_path.multi_load_mission) if x == cur_mission]
-                    idx_set.reverse()
-                    for idx in idx_set:
-                        del sub_path.multi_load_win[idx]
-                        del sub_path.multi_load_mission[idx]
+    def window_check(self, cur_mission):
+        """
+        检查时间窗是否存在冲突
+        :param cur_mission:
+        :return:
+        """
+        for cur_id, item in enumerate(cur_mission.path):
+            # 获取arc对象
+            item_path = self.init_map.edge_dic[item]
+            item_status = cur_mission.arc_status[cur_id]
+            # item_win = cur_mission.arc_win[cur_id]
+
+            # 检查总时间窗
+            for i in range(1, len(item_path.main_in_time)):
+                if item_path.main_in_time[i - 1] <= item_path.main_out_time[i - 1] <= item_path.main_in_time[i] <= \
+                        item_path.main_out_time[i]:
+                    continue
+                else:
+                    print('总时间窗出错了')
+
+            # 检查是否与冲突边存在问题
+            if item_status == 0:  # 车辆处于空载状态
+                for cur in item_path.empty_empty_clashed_edge_set:
+                    cur_path = self.init_map.edge_dic[cur]
+                    for k in range(1, len(cur_path.main_in_time)):
+                        if cur_path.main_in_time[k - 1] <= cur_path.main_out_time[k - 1] <= cur_path.main_in_time[k] <= \
+                                cur_path.main_out_time[k]:
+                            continue
+                        else:
+                            print('空载-空载出错了')
+
+                for cur in item_path.empty_load_clashed_edge_set:
+                    cur_path = self.init_map.edge_dic[cur]
+                    for k in range(1, len(cur_path.main_in_time)):
+                        if cur_path.main_in_time[k - 1] <= cur_path.main_out_time[k - 1] <= cur_path.main_in_time[k] <= \
+                                cur_path.main_out_time[k]:
+                            continue
+                        else:
+                            print('空载-负载出错了')
             else:
-                # 处理负载-空载的情况
-                for sub in item_path.multi_empty_clashed_edge_set:
-                    sub_path = self.init_map.edge_dic[sub]
-                    idx_set = [i for i, x in enumerate(sub_path.empty_mission) if x == cur_mission]
-                    idx_set.reverse()
-                    for idx in idx_set:
-                        del sub_path.empty_win[idx]
-                        del sub_path.empty_mission[idx]
-                # 处理负载-负载的情况
-                for sub in item_path.multi_load_clashed_edge_set:
-                    sub_path = self.init_map.edge_dic[sub]
-                    idx_set = [i for i, x in enumerate(sub_path.load_mission) if x == cur_mission]
-                    idx_set.reverse()
-                    for idx in idx_set:
-                        del sub_path.load_win[idx]
-                        del sub_path.load_mission[idx]
+                # 车辆处于负载状态
+                for cur in item_path.load_load_clashed_edge_set:
+                    cur_path = self.init_map.edge_dic[cur]
 
-                # 处理空载-超载的情况
-                for sub in item_path.multi_multi_clashed_edge_set:
-                    sub_path = self.init_map.edge_dic[sub]
-                    idx_set = [i for i, x in enumerate(sub_path.multi_load_mission) if x == cur_mission]
-                    idx_set.reverse()
-                    for idx in idx_set:
-                        del sub_path.multi_load_win[idx]
-                        del sub_path.multi_load_mission[idx]
+                    for k in range(1, len(cur_path.main_in_time)):
+                        if cur_path.main_in_time[k - 1] <= cur_path.main_out_time[k - 1] <= cur_path.main_in_time[k] <= \
+                                cur_path.main_out_time[k]:
+                            continue
+                        else:
+                            print('负载-负载出错了')
+
+                for cur in item_path.load_empty_clashed_edge_set:
+                    cur_path = self.init_map.edge_dic[cur]
+                    for k in range(1, len(cur_path.main_in_time)):
+                        if cur_path.main_in_time[k - 1] <= cur_path.main_out_time[k - 1] <= cur_path.main_in_time[k] <= \
+                                cur_path.main_out_time[k]:
+                            continue
+                        else:
+                            print('负载-空载出错了')
+        return
+
+    def check_win(self, item_path, conflict_path, item_win, status):
+        """
+        检查item_win是否与conflict_path上的主时间窗冲突
+        :param status:
+        :param conflict_path:
+        :param item_win:
+        :return:
+        """
+        if conflict_path.id in back_pos or item_path.id in back_pos:
+            return
+        for i in range(0, len(conflict_path.main_in_time)):
+            win = [conflict_path.main_in_time[i], conflict_path.main_out_time[i]]
+            conflict_mission = conflict_path.main_idx_mission[i]
+            if isinstance(conflict_mission, int):
+                continue
+            idx = [k for k, v in conflict_mission.arc_win.items() if v == win][0]
+            conflict_status = conflict_mission.arc_status[idx]
+            if item_win[0] < win[1] < item_win[1] and conflict_status == status:
+                print(item_path.id, conflict_path.id, item_win, win, conflict_status, status)
+                # print(conflict_mission.arc_win)
+            elif item_win[0] < win[0] < item_win[1] and conflict_status == status:
+                print(conflict_path.id, item_win, win)
+            else:
+                continue
+        return
+
+    def conflict_check(self, cur_mission):
+        """
+        逐个判断是否存在冲突
+        :param cur_mission:
+        :return:
+        """
+        for item_id, item in enumerate(cur_mission.path):
+            # 获取arc对象
+            item_path = self.init_map.edge_dic[item]
+            item_win = cur_mission.arc_win[item_id]
+            item_status = cur_mission.arc_status[item_id]
+
+            if item_status == 0:
+                # 说明车辆当前处于空载状态，需要判断其是否跟冲突边上时间窗冲突
+                for cur in item_path.empty_empty_clashed_edge_set:
+                    if cur != item:
+                        cur_path = self.init_map.edge_dic[cur]
+                        self.check_win(item_path, cur_path, item_win, 0)
+
+                for cur in item_path.empty_load_clashed_edge_set:
+                    if cur != item:
+                        cur_path = self.init_map.edge_dic[cur]
+                        self.check_win(item_path, cur_path, item_win, 1)
+            else:
+                # 说明车辆当前处于负载状态，需要判断其是否跟冲突边上时间窗冲突
+                for cur in item_path.load_empty_clashed_edge_set:
+                    if cur != item:
+                        cur_path = self.init_map.edge_dic[cur]
+                        self.check_win(item_path, cur_path, item_win, 0)
+
+                for cur in item_path.load_load_clashed_edge_set:
+                    if cur != item:
+                        cur_path = self.init_map.edge_dic[cur]
+                        self.check_win(item_path, cur_path, item_win, 1)
         return
 
 
 if __name__ == '__main__':
-    Interval = 500
-    test = MainAlgo()
-    test.back_location = back_pos_5
-    test.scheduling_mission()
-
-
-
-
-
-
+    Interval = 1000
+    dic = {10: back_pos_10, 15: back_pos_15, 20: back_pos_20, 25: back_pos_25, 30: back_pos_30}
+    for i in range(30, 31, 5):
+        print('AGV数量：', i)
+        for k in range(1):
+            test = MainAlgo()
+            test.mission_num = 100
+            test.agv_num = i
+            back_pos = back_pos_30
+            test.back_location = copy.deepcopy(back_pos)
+            test.init_agv()
+            start = time.time()
+            test.schedule_mission_cycle()
+            #print(test.total_conflict_time / test.total_time)
+            #print(test.wait_time / test.total_time)
+            #print((test.total_conflict_time - test.wait_time) / test.total_time)
+            print((time.time() - start) / 100)

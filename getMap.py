@@ -170,14 +170,27 @@ class Map:
             split_line = re.split(':|;', line)[:-1]  # remove \n
             cur_edge_idx = int(split_line[0])
             clashed_set = list(map(int, split_line[1:]))
-            """
+
             self.edge_dic[cur_edge_idx].clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].empty_empty_clashed_edge_set = self.empty_empty_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].empty_load_clashed_edge_set = self.empty_load_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].load_empty_clashed_edge_set = self.load_empty_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].load_load_clashed_edge_set = self.load_load_set[cur_edge_idx]
+
+            self.edge_dic[cur_edge_idx].empty_multi_clashed_edge_set = self.empty_load_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].load_multi_clashed_edge_set = self.load_load_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].multi_empty_clashed_edge_set = self.load_empty_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].multi_load_clashed_edge_set = self.load_load_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].multi_multi_clashed_edge_set = self.load_load_set[cur_edge_idx]
+
+            """
+            self.edge_dic[cur_edge_idx].clashed_edge_set = self.load_load_set[cur_edge_idx]
+            self.edge_dic[cur_edge_idx].empty_empty_clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].empty_load_clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].load_empty_clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].load_load_clashed_edge_set = self.load_load_set[cur_edge_idx]
-            """
 
+            
             self.edge_dic[cur_edge_idx].clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].empty_empty_clashed_edge_set = self.empty_empty_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].empty_load_clashed_edge_set = self.empty_load_set[cur_edge_idx]
@@ -188,8 +201,7 @@ class Map:
             self.edge_dic[cur_edge_idx].multi_multi_clashed_edge_set = self.load_load_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].multi_empty_clashed_edge_set = self.load_empty_set[cur_edge_idx]
             self.edge_dic[cur_edge_idx].multi_load_clashed_edge_set = self.load_load_set[cur_edge_idx]
-
-            """
+            
             self.edge_dic[cur_edge_idx].clashed_edge_set = clashed_set
             self.edge_dic[cur_edge_idx].empty_empty_clashed_edge_set = clashed_set
             self.edge_dic[cur_edge_idx].empty_load_clashed_edge_set = clashed_set
@@ -410,16 +422,16 @@ class Map:
             pickle.dump(self.load_load_set, tf)
         """
 
-        with open('data/empty_empty.pkl', 'rb') as tf:
+        with open('data/small/empty_empty.pkl', 'rb') as tf:
             self.empty_empty_set = pickle.load(tf)
 
-        with open('data/empty_load.pkl', 'rb') as tf:
+        with open('data/small/empty_load.pkl', 'rb') as tf:
             self.empty_load_set = pickle.load(tf)
 
-        with open('data/load_empty.pkl', 'rb') as tf:
+        with open('data/small/load_empty.pkl', 'rb') as tf:
             self.load_empty_set = pickle.load(tf)
 
-        with open('data/load_load.pkl', 'rb') as tf:
+        with open('data/small/load_load.pkl', 'rb') as tf:
             self.load_load_set = pickle.load(tf)
 
         return
